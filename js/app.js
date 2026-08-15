@@ -13,22 +13,60 @@
     isHost: false,
     name: '',
     sound: true,
-    voice: true,
     conn: 'wait',      // wait | online | bad
     called: [],
     last: null,
     rhyme: 'Bấm bốc số để mở màn.',
     grid: null,
     marks: null,
-    players: [],
-    wins: [],
-    note: '',          // dòng chữ tạm dưới thanh dock
+    players: [],       // quản trò: [{cid, name, on}]
+    wins: [],          // quản trò: [{name, line}]
+    claimed: {},       // người chơi: những đường đã hô rồi
+    note: '',
     joining: false,
     joinErr: '',
-    code: ''
+    code: '',
+    sheets: {},        // quản trò: mã máy → tờ đã phát, không phát trùng
+    cid: ''
   };
 
-  var hostTries = 0;
+  /* ── bộ nhớ máy ── */
+  function ls(k, v) {
+    try {
+      if (v === undefined) return localStorage.getItem(k);
+      if (v === null) { localStorage.removeItem(k); return null; }
+      localStorage.setItem(k, v); return v;
+    } catch (e) { return null; }
+  }
+  function myId() {
+    var k = ls('loto:cid');
+    if (!k) { k = 'm' + Math.random().toString(36).slice(2, 11); ls('loto:cid', k); }
+    return k;
+  }
+  function marksKey() { return 'loto:marks:' + (S.room || 'roi') + ':' + S.cid; }
+  function saveMarks() { ls(marksKey(), JSON.stringify(Array.from(S.marks))); }
+  function loadMarks() {
+    try { return new Set(JSON.parse(ls(marksKey()) || '[]')); } catch (e) { return new Set(); }
+  }
+  function clearMarks() { ls(marksKey(), null); }
+
+  /* Quản trò: giữ ván trong máy để tải lại trang không mất phòng */
+  function hostSave() {
+    if (!S.isHost || !S.room) return;
+    ls('loto:host', JSON.stringify({
+      code: S.room, called: S.called, last: S.last,
+      sheets: S.sheets, at: Date.now()
+    }));
+  }
+  function hostLoad() {
+    try {
+      var v = JSON.parse(ls('loto:host') || 'null');
+      if (!v || !v.code) return null;
+      if (Date.now() - (v.at || 0) > 12 * 3600 * 1000) return null;  // quá cũ thì bỏ
+      return v;
+    } catch (e) { return null; }
+  }
+  function hostClear() { ls('loto:host', null); }
 
   /* ── tiện ích ── */
   function esc(s) {
@@ -42,15 +80,25 @@
       ? 'Phòng đang mở · ' + Net.count() + ' máy đang nối'
       : 'Đã nối với quản trò';
     if (S.conn === 'bad') return 'Mất kết nối. Thử tải lại trang.';
-    return 'Đang bắt tay…';
+    return S.isHost ? 'Đang mở phòng…' : 'Đang nối lại, giữ nguyên trang này…';
   }
   function connDot() { return S.conn === 'online' ? 'ok' : S.conn === 'bad' ? 'bad' : 'wait'; }
+  function connHtml() {
+    return '<div class="conn" id="conn"><span class="dot ' + connDot() + '"></span>' +
+      esc(connText()) + '</div>';
+  }
 
   /* ═══════════ MÀN HÌNH CHÍNH ═══════════ */
   function viewHome() {
     var warn = Net.ready() ? '' :
       '<p class="err">Không tải được thư viện kết nối. Hai chế độ có mã phòng sẽ không chạy — ' +
       'kiểm tra mạng rồi tải lại trang. Hai chế độ không cần mã vẫn dùng bình thường.</p>';
+
+    var saved = hostLoad();
+    var resume = saved
+      ? stub('resume', '↩️', 'Mở lại phòng ' + esc(saved.code),
+          'Ván đang dở với ' + (saved.called || []).length + ' số đã ra. Người chơi tự nối lại, giữ nguyên tờ cũ.')
+      : '';
 
     return '' +
       '<div class="marquee">' +
@@ -62,7 +110,7 @@
           }).join('') +
         '</div>' +
       '</div>' +
-      warn +
+      warn + resume +
       '<div class="lbl">Cả nhóm cùng một ván</div>' +
       stub('host', '🎤', 'Tôi làm quản trò',
         'Mở phòng, lấy mã, bốc số. Số ra hiện thẳng trên máy mọi người.') +
@@ -74,12 +122,11 @@
       stub('solocard', '📄', 'Chỉ lấy một tờ lô tô',
         'Nghe hô tới đâu tự đậy nắp tới đó.') +
       '<div class="lbl">Thiết lập</div>' +
-      '<div class="toggle"><span>Giọng đọc số tiếng Việt</span>' +
-        '<button class="sw' + (S.voice ? ' on' : '') + '" data-act="sw-voice" aria-label="Bật tắt giọng đọc"></button></div>' +
       '<div class="toggle"><span>Tiếng động và nhạc kinh</span>' +
         '<button class="sw' + (S.sound ? ' on' : '') + '" data-act="sw-sound" aria-label="Bật tắt âm thanh"></button></div>' +
-      '<p class="note">Luật ván này: tờ 9 hàng × 9 cột, 45 số, mỗi hàng 5 số. ' +
-        'Đủ 5 nắp trên một hàng ngang là kinh.<br>' +
+      '<p class="note">Luật ván này: tờ 5 hàng × 5 cột, cả 25 ô đều có số. ' +
+        'Đủ 5 nắp trên một hàng ngang, một hàng dọc hoặc một đường xéo là kinh — tất cả 12 đường.<br>' +
+        'Quản trò phát cho mỗi người một tờ riêng, không ai trùng ai và không đổi tờ được.<br>' +
         'Máy quản trò giữ ván, nên quản trò cần để tab này mở suốt buổi.</p>';
   }
 
@@ -97,8 +144,7 @@
     var head = S.room
       ? '<div class="codebar"><div><div class="k">Mã phòng</div>' +
         '<div class="v">' + esc(S.room) + '</div></div>' +
-        '<div class="k right">Đọc mã này cho cả nhóm nhập vào</div></div>' +
-        '<div class="conn"><span class="dot ' + connDot() + '"></span>' + esc(connText()) + '</div>'
+        '<div class="k right">Đọc mã này cho cả nhóm nhập vào</div></div>' + connHtml()
       : '<div class="codebar"><div><div class="k">Chế độ</div>' +
         '<div class="v sm">Hô miệng</div></div>' +
         '<div class="k right">Máy này bốc số, bạn hô lớn cho cả nhóm</div></div>';
@@ -109,16 +155,16 @@
       board += '<div class="bn' + cls + '">' + n + '</div>';
     }
 
-    var wins = '';
+    var lists = '';
     if (S.room) {
-      wins = '<div class="lbl">Ai đã kinh</div>' + (S.wins.length
+      lists = '<div class="lbl">Ai đã kinh</div>' + (S.wins.length
         ? '<div class="list">' + S.wins.map(function (w) {
             return '<div class="item"><span>' + esc(w.name) + '</span>' +
-              '<span class="tag">kinh hàng ' + (w.row + 1) + '</span></div>';
+              '<span class="tag">' + esc(w.line) + '</span></div>';
           }).join('') + '</div>'
         : '<div class="empty">Chưa ai kinh. Ai hô kinh trên máy của họ thì tên sẽ hiện ngay ở đây.</div>');
 
-      wins += '<div class="lbl">Người trong phòng</div>' + (S.players.length
+      lists += '<div class="lbl">Người trong phòng</div>' + (S.players.length
         ? '<div class="list">' + S.players.map(function (p) {
             return '<div class="item"><span>' + esc(p.name) + '</span>' +
               '<span class="tag">' + (p.on ? 'đang nối' : 'rớt mạng') + '</span></div>';
@@ -128,7 +174,7 @@
 
     return '' +
       '<button class="back" data-act="back">← Về trang đầu</button>' + head +
-      '<div class="drum"><div class="chip ' + (S.last ? 'pop' : 'empty') + '" id="chip">' +
+      '<div class="drum"><div class="chip ' + (S.last ? 'pop' : 'empty') + '">' +
         '<span>' + (S.last === null ? 'chưa bốc' : S.last) + '</span></div></div>' +
       '<div class="rhyme">' + esc(S.rhyme) + '</div>' +
       '<div class="count">' + S.called.length + ' số đã ra · còn ' + left + '</div>' +
@@ -137,9 +183,9 @@
       '<div class="gap"></div>' +
       '<button class="btn btn-ghost" data-act="reset">Ván mới</button>' +
       '<div class="lbl">Bảng số đã ra</div><div class="board">' + board + '</div>' +
-      wins +
+      lists +
       '<p class="note">' + (S.room
-        ? 'Số bốc ra hiện gần như tức thì trên máy người chơi. Nếu ai đó rớt mạng, họ mở lại link và nhập mã là nhận đủ số đã ra.'
+        ? 'Số bốc ra hiện gần như tức thì trên máy người chơi. Lỡ tải lại trang cũng không sao — về trang đầu bấm "Mở lại phòng ' + esc(S.room) + '" là ván trở lại nguyên vẹn.'
         : 'Nhớ hô rõ và chậm, người chơi tự đậy nắp trên tờ của họ.') + '</p>';
   }
 
@@ -163,22 +209,32 @@
     var head = S.room
       ? '<div class="codebar"><div><div class="k">Đang trong phòng</div>' +
         '<div class="v">' + esc(S.room) + '</div></div>' +
-        '<button class="btn btn-ghost btn-sm" data-act="newsheet">Đổi tờ</button></div>' +
-        '<div class="conn"><span class="dot ' + connDot() + '"></span>' + esc(connText()) + '</div>'
+        '<div class="k right">' + esc(S.name || 'Khách') + '</div></div>' + connHtml()
       : '<div class="codebar"><div><div class="k">Tờ rời</div>' +
         '<div class="v sm">Tự đậy nắp</div></div>' +
-        '<button class="btn btn-ghost btn-sm" data-act="newsheet">Đổi tờ</button></div>';
+        '<div class="k right">Tải lại trang nếu muốn tờ khác</div></div>';
+
+    if (!S.grid) {
+      return '<button class="back" data-act="back">← Về trang đầu</button>' + head +
+        '<div class="sheet"><div class="waiting">Quản trò đang phát tờ cho bạn…</div></div>' +
+        '<p class="note">Mỗi người một tờ riêng do quản trò phát, không ai trùng ai.</p>';
+    }
+
+    var heads = '';
+    for (var c = 0; c < 5; c++) heads += '<div class="ch">' + Game.colLabel(c) + '</div>';
+
+    var winCells = winMap();
 
     var cells = '';
-    for (var r = 0; r < 9; r++) {
-      for (var c = 0; c < 9; c++) {
-        var n = S.grid[r][c];
-        if (n === null) { cells += '<div class="cell blank"></div>'; continue; }
-        var on = S.marks.has(r + '-' + c);
+    for (var r = 0; r < 5; r++) {
+      for (var c2 = 0; c2 < 5; c2++) {
+        var n = S.grid[r][c2], key = r + '-' + c2;
+        var on = S.marks.has(key);
         var lit = S.room && !on && S.called.indexOf(n) !== -1;
-        var rot = ((r * 7 + c * 13) % 17) - 8;
-        cells += '<button class="cell num' + (lit ? ' called' : '') + '" data-act="cell" ' +
-          'data-r="' + r + '" data-c="' + c + '" aria-label="Số ' + n + (on ? ', đã đậy' : '') + '">' +
+        var rot = ((r * 7 + c2 * 13) % 17) - 8;
+        cells += '<button class="cell num' + (lit ? ' called' : '') + (winCells[key] ? ' win' : '') +
+          '" data-act="cell" data-r="' + r + '" data-c="' + c2 + '" ' +
+          'aria-label="Số ' + n + (on ? ', đã đậy' : '') + '">' +
           '<span class="n">' + n + '</span>' +
           (on ? '<span class="cap" style="transform:rotate(' + rot + 'deg)"></span>' : '') +
           '</button>';
@@ -188,42 +244,60 @@
     return '' +
       '<button class="back" data-act="back">← Về trang đầu</button>' + head +
       '<div class="sheet">' +
-        '<div class="sheethead"><b>Lô tô</b><i>9 hàng · 45 số · kinh hàng ngang</i></div>' +
+        '<div class="sheethead"><b>Lô tô</b><i>25 ô · ngang dọc xéo đều ăn</i></div>' +
+        '<div class="colhead">' + heads + '</div>' +
         '<div class="grid" id="grid">' + cells + '</div>' +
-        '<div class="rowsflag" id="flags">' + flagsHtml() + '</div>' +
       '</div>' +
+      '<div id="claim">' + claimHtml() + '</div>' +
       '<p class="note">Chạm vào số để đậy nắp, chạm lần nữa để gỡ.' +
-        (S.room ? ' Số quản trò vừa bốc sẽ nhấp nháy viền đỏ trên tờ.'
+        (S.room ? ' Chỉ đậy được số quản trò đã bốc — số đó nhấp nháy viền đỏ trên tờ. Tờ này là của riêng bạn suốt ván, tải lại trang vẫn còn nguyên.'
                 : ' Nghe quản trò hô tới đâu, đậy tới đó.') + '</p>' +
       '<div class="dock"><div class="inner" id="dock">' + dockHtml() + '</div></div>';
   }
 
-  function rowInfo() {
-    return Game.rowStates(S.grid, S.marks, S.called, !!S.room);
+  function lineInfo() {
+    if (!S.grid) return [];
+    return Game.lineStates(S.grid, S.marks, S.called, !!S.room);
   }
-  function readyRow() {
-    var rs = rowInfo();
-    for (var i = 0; i < rs.length; i++) if (rs[i].full) return i;
-    return -1;
+  function winMap() {
+    var m = {};
+    lineInfo().forEach(function (L) {
+      if (L.full) L.cells.forEach(function (rc) { m[rc[0] + '-' + rc[1]] = 1; });
+    });
+    return m;
   }
-  function flagsHtml() {
-    return rowInfo().map(function (s, r) {
-      var cls = s.full ? ' full' : (s.marked ? ' p' : '');
-      return '<div class="rf' + cls + '" title="Hàng ' + (r + 1) + ': ' + s.marked + '/' + s.total + '"></div>';
-    }).join('');
+  /* Đường đã đủ nhưng chưa hô */
+  function openLine() {
+    var a = lineInfo();
+    for (var i = 0; i < a.length; i++) if (a[i].full && !S.claimed[a[i].label]) return a[i];
+    return null;
   }
+  function bestLine() {
+    var a = lineInfo(), b = null;
+    for (var i = 0; i < a.length; i++) if (!b || a[i].ok > b.ok) b = a[i];
+    return b;
+  }
+
+  /* Nút hô kinh cỡ lớn ngay dưới tờ, không bị thanh trình duyệt che */
+  function claimHtml() {
+    var L = openLine();
+    if (!L) return '';
+    return '<button class="btn btn-neon claimbtn" data-act="kinh">KINH! — ' + esc(L.label) + '</button>';
+  }
+
   function dockHtml() {
-    var rr = readyRow();
-    var b = S.note ? S.note
-      : rr >= 0 ? 'Hàng ' + (rr + 1) + ' đủ 5 nắp!'
+    var L = openLine(), b = bestLine();
+    var msg = S.note ? S.note
+      : L ? 'Đủ rồi! Bấm nút KINH.'
+      : (b && b.ok > 0) ? 'Gần nhất: ' + b.label + ' · ' + b.ok + '/5'
       : S.room ? S.called.length + ' số đã ra'
-      : 'Đậy đủ 5 nắp một hàng là kinh';
+      : 'Đủ 5 nắp một đường là kinh';
     return '<div class="lastnum' + (S.last === null ? ' dim' : '') + '">' +
         (S.last === null ? 'chờ' : S.last) + '</div>' +
       '<div class="dockmeta"><div class="a">' + (S.room ? 'Số vừa ra' : 'Tự chấm') + '</div>' +
-        '<div class="b">' + esc(b) + '</div></div>' +
+        '<div class="b">' + esc(msg) + '</div></div>' +
       '<button class="btn btn-neon btn-sm" data-act="kinh" style="flex:none;min-width:92px"' +
-        (rr < 0 ? ' disabled' : '') + '>KINH!</button>';
+        (L ? '' : ' disabled') + '>KINH!</button>';
   }
 
   /* ── vẽ lại ── */
@@ -241,13 +315,15 @@
   function patchCard() {
     if (S.screen !== 'card') return;
     var g = q('#grid'); if (!g) return;
+
+    var winCells = winMap();
     var btns = g.querySelectorAll('.cell.num');
     for (var i = 0; i < btns.length; i++) {
       var b = btns[i];
-      var r = +b.dataset.r, c = +b.dataset.c, n = S.grid[r][c];
-      var on = S.marks.has(r + '-' + c);
-      var lit = S.room && !on && S.called.indexOf(n) !== -1;
-      b.classList.toggle('called', !!lit);
+      var r = +b.dataset.r, c = +b.dataset.c, n = S.grid[r][c], key = r + '-' + c;
+      var on = S.marks.has(key);
+      b.classList.toggle('called', !!(S.room && !on && S.called.indexOf(n) !== -1));
+      b.classList.toggle('win', !!winCells[key]);
       var cap = b.querySelector('.cap');
       if (on && !cap) {
         var s = document.createElement('span');
@@ -256,30 +332,37 @@
         b.appendChild(s);
       } else if (!on && cap) { cap.remove(); }
     }
-    q('#flags').innerHTML = flagsHtml();
-    q('#dock').innerHTML = dockHtml();
+    var cl = q('#claim'); if (cl) cl.innerHTML = claimHtml();
+    var dk = q('#dock'); if (dk) dk.innerHTML = dockHtml();
   }
 
+  function patchConn() {
+    var c = q('#conn');
+    if (c) c.innerHTML = '<span class="dot ' + connDot() + '"></span>' + esc(connText());
+  }
+
+  var noteTimer = null;
   function toast(msg) {
     S.note = msg;
-    if (S.screen === 'card') { var d = q('#dock'); if (d) d.innerHTML = dockHtml(); }
-    setTimeout(function () {
+    var d = q('#dock'); if (d) d.innerHTML = dockHtml();
+    if (noteTimer) clearTimeout(noteTimer);
+    noteTimer = setTimeout(function () {
       S.note = '';
-      if (S.screen === 'card') { var d2 = q('#dock'); if (d2) d2.innerHTML = dockHtml(); }
-    }, 6000);
+      var d2 = q('#dock'); if (d2) d2.innerHTML = dockHtml();
+    }, 4500);
   }
 
   /* ═══════════ MÀN KINH ═══════════ */
-  function showKinh(row, who) {
+  function showKinh(label, who) {
     var box = document.createElement('div');
     box.className = 'kinh';
     box.innerHTML = '<div><h2>Kinh!</h2><p>' +
-      (who ? esc(who) + ' kinh hàng ' + (row + 1) + '.' : 'Hàng ' + (row + 1) + ' đã đủ 5 nắp. Hô lớn lên cho cả nhóm nghe.') +
+      (who ? esc(who) + ' kinh ' + esc(label) + '.'
+           : 'Bạn đủ 5 nắp trên ' + esc(label) + '. Hô lớn lên cho cả nhóm nghe.') +
       '</p><button class="btn btn-gold">Chơi tiếp</button></div>';
     var bits = [];
     for (var i = 0; i < 34; i++) {
-      var s = document.createElement('span');
-      var sz = 10 + Math.random() * 12;
+      var s = document.createElement('span'), sz = 10 + Math.random() * 12;
       s.className = 'conf';
       s.style.left = (Math.random() * 100) + 'vw';
       s.style.width = sz + 'px'; s.style.height = sz + 'px';
@@ -287,59 +370,74 @@
       s.style.animationDelay = (Math.random() * 1.1) + 's';
       document.body.appendChild(s); bits.push(s);
     }
-    function close() {
-      box.remove();
-      bits.forEach(function (b) { b.remove(); });
-    }
+    function close() { box.remove(); bits.forEach(function (b) { b.remove(); }); }
     box.addEventListener('click', close);
     document.body.appendChild(box);
     setTimeout(close, 9000);
   }
 
-  /* ═══════════ HÀNH ĐỘNG ═══════════ */
+  /* ═══════════ QUẢN TRÒ: MỞ PHÒNG ═══════════ */
+  var hostTries = 0;
 
-  function openHostRoom() {
+  function openHostRoom(saved) {
     if (!Net.ready()) return;
     hostTries = 0;
     S.isHost = true; S.conn = 'wait';
-    S.called = []; S.last = null; S.wins = []; S.players = [];
-    S.rhyme = 'Bấm bốc số để mở màn.';
-    tryHost();
+    if (saved) {
+      S.called = saved.called || [];
+      S.last = (saved.last === undefined ? null : saved.last);
+      S.sheets = saved.sheets || {};
+      S.rhyme = 'Phòng đã mở lại. Bốc tiếp thôi.';
+    } else {
+      S.called = []; S.last = null; S.sheets = {};
+      S.rhyme = 'Bấm bốc số để mở màn.';
+    }
+    S.wins = []; S.players = [];
+    tryHost(saved ? saved.code : null);
     S.screen = 'caller';
     render();
   }
 
-  function tryHost() {
-    var code = Game.newCode();
-    S.room = code;
-    Net.host(code, {
+  function tryHost(fixedCode) {
+    S.room = fixedCode || Game.newCode();
+    hostSave();
+    Net.host(S.room, {
       state: function () { return { called: S.called, last: S.last }; },
-      status: function (st) { S.conn = st; if (S.screen === 'caller') render(); },
+      status: function (st) {
+        S.conn = st;
+        if (S.screen === 'caller') render();
+      },
       taken: function () {
-        if (hostTries++ < 5) tryHost();
-        else { S.conn = 'bad'; render(); }
+        if (hostTries++ < 6) return tryHost(null);   // mã kẹt thì đổi mã khác
+        S.conn = 'bad'; render();
       },
       fail: function () { S.conn = 'bad'; render(); },
-      player: function (name, id) {
+      player: function (name, cid, pid, reply) {
+        if (!S.sheets[cid]) {
+          var used = Object.keys(S.sheets).map(function (k) { return Game.cardKey(S.sheets[k]); });
+          S.sheets[cid] = Game.makeUniqueCard(used);
+          hostSave();
+        }
+        reply({ t: 'sheet', grid: S.sheets[cid] });
         var found = false;
         S.players = S.players.map(function (p) {
-          if (p.id === id) { found = true; return { id: id, name: name, on: true }; }
+          if (p.cid === cid) { found = true; return { cid: cid, name: name, on: true }; }
           return p;
         });
-        if (!found) S.players.push({ id: id, name: name, on: true });
+        if (!found) S.players.push({ cid: cid, name: name, on: true });
         if (S.screen === 'caller') render();
       },
-      leave: function (id) {
+      leave: function (cid) {
         S.players = S.players.map(function (p) {
-          return p.id === id ? { id: p.id, name: p.name, on: false } : p;
+          return p.cid === cid ? { cid: p.cid, name: p.name, on: false } : p;
         });
         if (S.screen === 'caller') render();
       },
-      kinh: function (name, row) {
-        S.wins.push({ name: name, row: row });
-        Sfx.kinh(); Sfx.say(name + ' kinh rồi!');
+      kinh: function (name, cid, line) {
+        S.wins.push({ name: name, line: line });
+        Sfx.kinh();
         if (S.screen === 'caller') render();
-        showKinh(row, name);
+        showKinh(line, name);
       }
     });
   }
@@ -349,21 +447,25 @@
     if (n === null) return;
     S.called = S.called.concat([n]);
     S.last = n;
-    var line = Game.rhyme();
-    S.rhyme = line + ' con ' + Game.viNum(n) + '!';
-    Sfx.draw(); Sfx.say(line + ' con ' + Game.viNum(n));
-    if (S.room) Net.broadcast({ t: 'state', called: S.called, last: S.last });
+    S.rhyme = Game.rhyme() + ' con ' + Game.viNum(n) + '!';
+    Sfx.draw();
+    if (S.room) { Net.broadcast({ t: 'state', called: S.called, last: S.last }); hostSave(); }
     render();
   }
 
   function doReset() {
-    if (S.called.length && !window.confirm('Xoá hết số đã bốc và bắt đầu ván mới?')) return;
-    S.called = []; S.last = null; S.wins = [];
+    if (S.called.length && !window.confirm('Xoá hết số đã bốc, phát tờ mới cho cả phòng?')) return;
+    S.called = []; S.last = null; S.wins = []; S.sheets = {};
     S.rhyme = 'Ván mới. Bấm bốc số để mở màn.';
-    if (S.room) Net.broadcast({ t: 'state', called: [], last: null });
+    if (S.room) {
+      Net.broadcast({ t: 'state', called: [], last: null });
+      Net.broadcast({ t: 'newgame' });
+      hostSave();
+    }
     render();
   }
 
+  /* ═══════════ NGƯỜI CHƠI ═══════════ */
   function doEnter() {
     var fc = q('#fcode'), fn = q('#fname');
     var code = ((fc ? fc.value : S.code) || '').trim().toUpperCase();
@@ -374,32 +476,45 @@
 
     S.joining = true; S.joinErr = ''; render();
 
-    Net.join(code, S.name || 'Khách', {
+    Net.join(code, S.name || 'Khách', S.cid, {
       status: function (st) {
         S.conn = st;
         if (st === 'online' && S.screen !== 'card') {
           S.joining = false; S.room = code; S.isHost = false;
-          S.grid = Game.makeCard(); S.marks = new Set();
+          S.grid = null; S.claimed = {}; S.marks = loadMarks();
           S.called = []; S.last = null; S.screen = 'card';
-        }
+          render();
+        } else if (S.screen === 'card') { patchConn(); }
+        else { render(); }
+      },
+      sheet: function (grid) {
+        S.grid = grid;
+        S.marks = loadMarks();
         render();
       },
+      newgame: function () {
+        clearMarks();
+        S.grid = null; S.marks = new Set(); S.claimed = {};
+        S.called = []; S.last = null;
+        render();
+        Net.toHost({ t: 'hello', name: S.name || 'Khách', cid: S.cid });
+      },
       state: function (called, last) {
-        var isNew = last !== null && last !== S.last;
+        var isNew = (last !== null && last !== undefined && last !== S.last);
         S.called = called || [];
         S.last = (last === undefined ? null : last);
-        if (isNew && S.last !== null) { Sfx.draw(); Sfx.say('Con ' + Game.viNum(S.last)); }
+        if (isNew) Sfx.draw();
         if (S.screen === 'card') patchCard(); else render();
       },
-      winner: function (name, row) {
-        if (name === (S.name || 'Khách')) return;
-        toast(name + ' vừa kinh hàng ' + (row + 1));
+      winner: function (name, cid, line) {
+        if (cid && cid === S.cid) return;
+        toast(name + ' vừa kinh ' + line);
       },
       fail: function (why) {
         S.joining = false; S.screen = 'join';
-        S.joinErr = why === 'noroom' || why === 'timeout'
+        S.joinErr = (why === 'noroom' || why === 'timeout')
           ? 'Không vào được phòng ' + code + '. Kiểm tra lại mã, và chắc chắn máy quản trò vẫn đang mở.'
-          : why === 'lost' ? 'Mất kết nối với quản trò. Thử vào lại phòng.'
+          : why === 'lost' ? 'Mất kết nối với quản trò quá lâu. Thử vào lại phòng.'
           : 'Chưa tải được thư viện kết nối. Kiểm tra mạng rồi tải lại trang.';
         Net.leave();
         render();
@@ -408,52 +523,50 @@
   }
 
   function doCell(r, c) {
-    if (S.grid[r][c] === null) return;
-    var key = r + '-' + c;
-    if (S.marks.has(key)) S.marks.delete(key);
-    else { S.marks.add(key); Sfx.tap(); }
-    patchCard();
+    var key = r + '-' + c, n = S.grid[r][c];
+    if (S.marks.has(key)) { S.marks.delete(key); saveMarks(); patchCard(); return; }
+    if (S.room && S.called.indexOf(n) === -1) {   // chưa bốc thì chưa được đậy
+      toast('Số ' + n + ' chưa được bốc.');
+      return;
+    }
+    S.marks.add(key); Sfx.tap(); saveMarks(); patchCard();
   }
 
   function doKinh() {
-    var rr = readyRow();
-    if (rr < 0) return;
-    Sfx.kinh(); Sfx.say('Kinh! Kinh rồi!');
-    showKinh(rr, null);
-    if (S.room) Net.toHost({ t: 'kinh', name: S.name || 'Khách', row: rr });
-  }
-
-  function doNewSheet() {
-    if (S.marks.size && !window.confirm('Lấy tờ khác? Các nắp đang đậy sẽ mất.')) return;
-    S.grid = Game.makeCard(); S.marks = new Set();
-    render();
+    var L = openLine();
+    if (!L) return;
+    S.claimed[L.label] = true;
+    Sfx.kinh();
+    showKinh(L.label, null);
+    if (S.room) Net.toHost({ t: 'kinh', name: S.name || 'Khách', cid: S.cid, line: L.label });
+    patchCard();
   }
 
   function goHome() {
     Net.leave();
     S.screen = 'home'; S.room = null; S.isHost = false; S.conn = 'wait';
-    S.called = []; S.last = null; S.wins = []; S.players = [];
-    S.joining = false; S.joinErr = ''; S.note = '';
+    S.called = []; S.last = null; S.wins = []; S.players = []; S.sheets = {};
+    S.grid = null; S.claimed = {}; S.joining = false; S.joinErr = ''; S.note = '';
     render();
   }
 
   /* ═══════════ SỰ KIỆN ═══════════ */
   el.addEventListener('click', function (e) {
-    var t = e.target.closest('[data-act]');
+    var t = e.target.closest ? e.target.closest('[data-act]') : null;
     if (!t) return;
     var a = t.dataset.act;
 
-    if (a === 'host') return openHostRoom();
+    if (a === 'host') { hostClear(); return openHostRoom(null); }
+    if (a === 'resume') return openHostRoom(hostLoad());
     if (a === 'join') { S.screen = 'join'; S.joinErr = ''; return render(); }
     if (a === 'solocaller') {
       S.room = null; S.isHost = false; S.called = []; S.last = null;
       S.rhyme = 'Bấm bốc số để mở màn.'; S.screen = 'caller'; return render();
     }
     if (a === 'solocard') {
-      S.room = null; S.grid = Game.makeCard(); S.marks = new Set();
-      S.called = []; S.last = null; S.screen = 'card'; return render();
+      S.room = null; S.grid = Game.makeCard(); S.marks = new Set(); S.claimed = {};
+      clearMarks(); S.called = []; S.last = null; S.screen = 'card'; return render();
     }
-    if (a === 'sw-voice') { S.voice = !S.voice; Sfx.setVoice(S.voice); return render(); }
     if (a === 'sw-sound') { S.sound = !S.sound; Sfx.setSound(S.sound); Sfx.tap(); return render(); }
 
     if (a === 'back') return goHome();
@@ -462,7 +575,6 @@
     if (a === 'enter') return doEnter();
     if (a === 'cell') return doCell(+t.dataset.r, +t.dataset.c);
     if (a === 'kinh') return doKinh();
-    if (a === 'newsheet') return doNewSheet();
   });
 
   el.addEventListener('keydown', function (e) {
@@ -477,13 +589,17 @@
     if (e.target.id === 'fname') S.name = e.target.value;
   });
 
-  window.addEventListener('beforeunload', function () {
-    if (S.isHost && Net.count() > 0) Net.leave();
+  /* Quản trò lỡ tay đóng tab thì hỏi lại một câu */
+  window.addEventListener('beforeunload', function (e) {
+    if (S.isHost && S.room && Net.count() > 0) {
+      e.preventDefault(); e.returnValue = '';
+      return '';
+    }
   });
 
   /* ── khởi động ── */
+  S.cid = myId();
   Sfx.setSound(S.sound);
-  Sfx.setVoice(S.voice);
   render();
 
 })();

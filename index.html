@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Lô Tô — hội chợ trong túi áo</title>
-<meta name="description" content="Game lô tô truyền thống chơi tập thể trên điện thoại. Tờ 9 hàng 45 số, kinh hàng ngang.">
+<meta name="description" content="Game lô tô chơi tập thể trên điện thoại. Tờ 5×5 đủ 25 số, kinh hàng ngang, hàng dọc hoặc đường xéo.">
 <meta name="theme-color" content="#141033">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎟️</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -19,6 +19,12 @@
 </main>
 
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+/* Nguồn dự phòng, phòng khi unpkg chậm hoặc bị chặn */
+if (typeof Peer === 'undefined') {
+  document.write('<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"><\/script>');
+}
+</script>
 <script src="js/game.js"></script>
 <script src="js/audio.js"></script>
 <script src="js/net.js"></script>

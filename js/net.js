@@ -5,9 +5,11 @@
 
    Bản tin:
      quản trò → người chơi : {t:'state', called:[…], last:n}
-                             {t:'winner', name:'…', row:0}
-     người chơi → quản trò : {t:'hello', name:'…'}
-                             {t:'kinh',  name:'…', row:0}
+                             {t:'sheet', grid:[[…]]}      ← tờ riêng, quản trò phát
+                             {t:'newgame'}                ← ván mới, xin tờ khác
+                             {t:'winner', name:'…', cid:'…', line:'hàng dọc 3'}
+     người chơi → quản trò : {t:'hello', name:'…', cid:'…'}
+                             {t:'kinh',  name:'…', cid:'…', line:'hàng dọc 3'}
    ───────────────────────────────────────────── */
 
 var Net = (function () {
@@ -47,15 +49,20 @@ var Net = (function () {
       });
       c.on('data', function (m) {
         if (!m || !m.t) return;
-        if (m.t === 'hello' && h.player) h.player(m.name || 'Khách', c.peer);
+        if (m.t === 'hello' && h.player) {
+          c.__cid = m.cid || c.peer;
+          h.player(m.name || 'Khách', c.__cid, c.peer, function (msg) {
+            try { if (c.open) c.send(msg); } catch (e) { }
+          });
+        }
         if (m.t === 'kinh' && h.kinh) {
-          h.kinh(m.name || 'Khách', m.row);
-          broadcast({ t: 'winner', name: m.name || 'Khách', row: m.row });
+          h.kinh(m.name || 'Khách', m.cid || c.__cid, m.line);
+          broadcast({ t: 'winner', name: m.name || 'Khách', cid: m.cid || c.__cid, line: m.line });
         }
       });
       c.on('close', function () {
         conns = conns.filter(function (x) { return x !== c; });
-        if (h.leave) h.leave(c.peer);
+        if (h.leave) h.leave(c.__cid || c.peer);
       });
       c.on('error', function () { });
     });
@@ -77,14 +84,14 @@ var Net = (function () {
   }
 
   /* ── NGƯỜI CHƠI ── */
-  function join(code, name, handlers) {
+  function join(code, name, cid, handlers) {
     cleanup();
     role = 'guest'; h = handlers || {};
     if (!ready()) { if (h.fail) h.fail('nolib'); return; }
 
     peer = new Peer(null, { debug: 0 });
 
-    peer.on('open', function () { link(code, name); });
+    peer.on('open', function () { link(code, name, cid); });
 
     peer.on('disconnected', function () {
       if (h.status) h.status('wait');
@@ -102,27 +109,29 @@ var Net = (function () {
     }, 12000);
   }
 
-  function link(code, name) {
+  function link(code, name, cid) {
     conn = peer.connect(PREFIX + code, { reliable: true });
 
     conn.on('open', function () {
       retry = 0;
       if (joinTimer) { clearTimeout(joinTimer); joinTimer = null; }
       if (h.status) h.status('online');
-      try { conn.send({ t: 'hello', name: name }); } catch (e) { }
+      try { conn.send({ t: 'hello', name: name, cid: cid }); } catch (e) { }
     });
 
     conn.on('data', function (m) {
       if (!m || !m.t) return;
       if (m.t === 'state' && h.state) h.state(m.called || [], m.last);
-      if (m.t === 'winner' && h.winner) h.winner(m.name, m.row);
+      if (m.t === 'sheet' && h.sheet) h.sheet(m.grid);
+      if (m.t === 'newgame' && h.newgame) h.newgame();
+      if (m.t === 'winner' && h.winner) h.winner(m.name, m.cid, m.line);
     });
 
     conn.on('close', function () {
       if (h.status) h.status('wait');
-      if (retry < 12) {
+      if (retry < 40) {
         retry++;
-        setTimeout(function () { if (peer && !peer.destroyed) link(code, name); }, 2500);
+        setTimeout(function () { if (peer && !peer.destroyed) link(code, name, cid); }, 2500);
       } else if (h.fail) h.fail('lost');
     });
 
