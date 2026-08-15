@@ -1,151 +1,221 @@
 /* ─────────────────────────────────────────────
-   Đồng bộ đa thiết bị bằng PeerJS (WebRTC).
-   Máy quản trò giữ ván; máy người chơi nối thẳng vào bằng mã phòng.
-   Không cần server riêng, chỉ mượn broker công cộng của PeerJS để bắt tay.
+   Đồng bộ qua máy chủ chuyển tiếp công cộng (MQTT trên WebSocket).
+   Máy quản trò đẩy số lên máy chủ, máy người chơi lấy về.
+   Máy nào vào được internet là chạy — không còn phụ thuộc việc hai máy
+   có nối thẳng được với nhau hay không.
 
-   Bản tin:
-     quản trò → người chơi : {t:'state', called:[…], last:n}
-                             {t:'sheet', grid:[[…]]}      ← tờ riêng, quản trò phát
-                             {t:'newgame'}                ← ván mới, xin tờ khác
-                             {t:'winner', name:'…', cid:'…', line:'hàng dọc 3'}
-     người chơi → quản trò : {t:'hello', name:'…', cid:'…'}
-                             {t:'kinh',  name:'…', cid:'…', line:'hàng dọc 3'}
+   Ký tự đầu của mã phòng cho biết dùng máy chủ nào, nhờ vậy người chơi
+   luôn về đúng chỗ quản trò đang đứng.
+
+   Chủ đề (topic) dùng cho mỗi phòng loto/<mã>/… :
+     host        quản trò còn đó hay không   (giữ lại, có di chúc)
+     state       số đã bốc                   (giữ lại)
+     sheet/<máy> tờ phát riêng cho từng máy  (giữ lại)
+     ctl         lệnh ván mới
+     win         ai vừa kinh
+     ev          người chơi gửi lên quản trò
    ───────────────────────────────────────────── */
 
 var Net = (function () {
 
-  var PREFIX = 'lototet-';      // tránh trùng id với ứng dụng khác trên broker chung
-  var peer = null;
-  var conns = [];               // quản trò: các kết nối đang mở
-  var conn = null;              // người chơi: kết nối tới quản trò
-  var role = null;              // 'host' | 'guest'
-  var h = {};                   // handlers
-  var retry = 0;
-  var joinTimer = null;
+  var BROKERS = [
+    { tag: 'A', url: 'wss://broker.emqx.io:8084/mqtt' },
+    { tag: 'B', url: 'wss://broker.hivemq.com:8884/mqtt' },
+    { tag: 'C', url: 'wss://test.mosquitto.org:8081/mqtt' }
+  ];
 
-  function ready() { return typeof Peer !== 'undefined'; }
+  var cli = null;
+  var role = null;          // 'host' | 'guest'
+  var h = {};
+  var code = null;
+  var T = null;
+  var seen = {};            // quản trò: mã máy đang trong phòng
+  var myCid = null;
+  var tries = 0;
+  var timer = null;
+  var settled = false;
 
-  function cleanup() {
-    if (joinTimer) { clearTimeout(joinTimer); joinTimer = null; }
-    try { if (peer) peer.destroy(); } catch (e) { }
-    peer = null; conns = []; conn = null; role = null; retry = 0;
+  function ready() { return typeof mqtt !== 'undefined'; }
+
+  function topics(c) {
+    var b = 'loto/' + c;
+    return { host: b + '/host', state: b + '/state', ctl: b + '/ctl',
+             win: b + '/win', ev: b + '/ev', sheet: b + '/sheet/' };
   }
 
-  /* ── QUẢN TRÒ ── */
-  function host(code, handlers) {
-    cleanup();
+  function brokerOf(c) {
+    for (var i = 0; i < BROKERS.length; i++) if (BROKERS[i].tag === c.charAt(0)) return i;
+    return -1;
+  }
+
+  function cid8() { return 'lt' + Math.random().toString(16).slice(2, 10); }
+
+  function clear() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (cli) { try { cli.end(true); } catch (e) { } }
+    cli = null; role = null; code = null; T = null; seen = {}; settled = false; tries = 0;
+  }
+
+  function send(topic, obj, retain) {
+    if (!cli) return;
+    try { cli.publish(topic, JSON.stringify(obj), { qos: 0, retain: !!retain }); } catch (e) { }
+  }
+
+  /* ═══════════ QUẢN TRÒ ═══════════ */
+
+  /* fullCode = null → mở phòng mới, tự chọn máy chủ nào nối được
+     fullCode có sẵn → mở lại đúng phòng cũ, phải dùng đúng máy chủ đó */
+  function host(fullCode, handlers) {
+    clear();
     role = 'host'; h = handlers || {};
     if (!ready()) { if (h.fail) h.fail('nolib'); return; }
-
-    peer = new Peer(PREFIX + code, { debug: 0 });
-
-    peer.on('open', function () { if (h.status) h.status('online'); });
-
-    peer.on('connection', function (c) {
-      conns.push(c);
-      c.on('open', function () {
-        // gửi ngay toàn bộ ván cho người mới vào
-        try { c.send({ t: 'state', called: h.state().called, last: h.state().last }); } catch (e) { }
-      });
-      c.on('data', function (m) {
-        if (!m || !m.t) return;
-        if (m.t === 'hello' && h.player) {
-          c.__cid = m.cid || c.peer;
-          h.player(m.name || 'Khách', c.__cid, c.peer, function (msg) {
-            try { if (c.open) c.send(msg); } catch (e) { }
-          });
-        }
-        if (m.t === 'kinh' && h.kinh) {
-          h.kinh(m.name || 'Khách', m.cid || c.__cid, m.line);
-          broadcast({ t: 'winner', name: m.name || 'Khách', cid: m.cid || c.__cid, line: m.line });
-        }
-      });
-      c.on('close', function () {
-        conns = conns.filter(function (x) { return x !== c; });
-        if (h.leave) h.leave(c.__cid || c.peer);
-      });
-      c.on('error', function () { });
-    });
-
-    peer.on('disconnected', function () {
-      if (h.status) h.status('wait');
-      try { peer.reconnect(); } catch (e) { }
-    });
-
-    peer.on('error', function (err) {
-      var t = err && err.type;
-      if (t === 'unavailable-id') { if (h.taken) h.taken(); return; }
-      if (t === 'network' || t === 'server-error' || t === 'socket-error') {
-        if (h.status) h.status('wait');
-        return;
-      }
-      if (h.status) h.status('bad');
-    });
+    tries = fullCode ? brokerOf(fullCode) : 0;
+    if (tries < 0) { if (h.fail) h.fail('badcode'); return; }
+    hostTry(fullCode, !fullCode);
   }
 
-  /* ── NGƯỜI CHƠI ── */
-  function join(code, name, cid, handlers) {
-    cleanup();
-    role = 'guest'; h = handlers || {};
+  function hostTry(fullCode, mayHop) {
+    if (tries >= BROKERS.length) { if (h.fail) h.fail('broker'); return; }
+    var B = BROKERS[tries];
+    code = fullCode || (B.tag + Game.newCode());
+    T = topics(code);
+
+    if (h.status) h.status('wait');
+
+    cli = mqtt.connect(B.url, {
+      clientId: 'loto_' + cid8(),
+      clean: true, keepalive: 30,
+      connectTimeout: 9000, reconnectPeriod: 3000,
+      will: { topic: T.host, payload: JSON.stringify({ on: false }), qos: 0, retain: true }
+    });
+
+    var hopped = false;
+    function hop() {
+      if (hopped || !mayHop) return;
+      hopped = true;
+      try { cli.end(true); } catch (e) { }
+      tries++;
+      hostTry(null, true);
+    }
+    timer = setTimeout(function () {
+      if (!settled) { if (mayHop) hop(); else if (h.fail) h.fail('broker'); }
+    }, 11000);
+
+    cli.on('connect', function () {
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      cli.subscribe(T.ev, { qos: 0 });
+      send(T.host, { on: true }, true);
+      if (h.state) send(T.state, { t: 'state', called: h.state().called, last: h.state().last }, true);
+      if (h.code) h.code(code);
+      if (h.status) h.status('online');
+    });
+
+    cli.on('message', function (topic, buf) {
+      if (topic !== T.ev) return;
+      var m; try { m = JSON.parse(buf.toString()); } catch (e) { return; }
+      if (!m || !m.t) return;
+
+      if (m.t === 'hello' && h.player) {
+        seen[m.cid] = 1;
+        h.player(m.name || 'Khách', m.cid, m.cid, function (msg) {
+          send(T.sheet + m.cid, msg, true);
+        });
+      }
+      if (m.t === 'bye') { delete seen[m.cid]; if (h.leave) h.leave(m.cid); }
+      if (m.t === 'kinh' && h.kinh) {
+        h.kinh(m.name || 'Khách', m.cid, m.line);
+        send(T.win, { name: m.name || 'Khách', cid: m.cid, line: m.line, at: Date.now() });
+      }
+    });
+
+    cli.on('reconnect', function () { if (h.status) h.status('wait'); });
+    cli.on('offline', function () { if (h.status) h.status('wait'); });
+    cli.on('error', function () { if (!settled) hop(); });
+    cli.on('close', function () { if (!settled) hop(); });
+  }
+
+  /* ═══════════ NGƯỜI CHƠI ═══════════ */
+  function join(fullCode, name, myId, handlers) {
+    clear();
+    role = 'guest'; h = handlers || {}; myCid = myId;
     if (!ready()) { if (h.fail) h.fail('nolib'); return; }
 
-    peer = new Peer(null, { debug: 0 });
+    var bi = brokerOf(fullCode);
+    if (bi < 0) { if (h.fail) h.fail('badcode'); return; }
 
-    peer.on('open', function () { link(code, name, cid); });
+    code = fullCode; T = topics(code);
+    var roomSeen = false;
 
-    peer.on('disconnected', function () {
-      if (h.status) h.status('wait');
-      try { peer.reconnect(); } catch (e) { }
+    cli = mqtt.connect(BROKERS[bi].url, {
+      clientId: 'loto_' + cid8(),
+      clean: true, keepalive: 30,
+      connectTimeout: 9000, reconnectPeriod: 3000,
+      will: { topic: T.ev, payload: JSON.stringify({ t: 'bye', cid: myCid }), qos: 0, retain: false }
     });
 
-    peer.on('error', function (err) {
-      var t = err && err.type;
-      if (t === 'peer-unavailable') { if (h.fail) h.fail('noroom'); return; }
-      if (h.status) h.status('wait');
-    });
-
-    joinTimer = setTimeout(function () {
-      if (!conn || !conn.open) { if (h.fail) h.fail('timeout'); }
+    timer = setTimeout(function () {
+      if (!roomSeen && h.fail) h.fail(settled ? 'noroom' : 'broker');
     }, 12000);
+
+    cli.on('connect', function () {
+      settled = true;
+      cli.subscribe([T.host, T.state, T.ctl, T.win, T.sheet + myCid], { qos: 0 });
+    });
+
+    cli.on('message', function (topic, buf) {
+      var txt = buf.toString();
+      if (!txt) return;                       // tin đã bị xoá
+      var m; try { m = JSON.parse(txt); } catch (e) { return; }
+
+      if (topic === T.host) {
+        if (m.on) {
+          if (!roomSeen) {
+            roomSeen = true;
+            if (timer) { clearTimeout(timer); timer = null; }
+            if (h.status) h.status('online');
+            send(T.ev, { t: 'hello', name: name, cid: myCid });
+          } else if (h.status) h.status('online');
+        } else if (roomSeen && h.status) h.status('wait');
+        return;
+      }
+      if (topic === T.state && h.state) { h.state(m.called || [], m.last); return; }
+      if (topic === T.sheet + myCid && h.sheet) { h.sheet(m.grid || m); return; }
+      if (topic === T.ctl) {
+        if (m.t === 'newgame' && h.newgame) h.newgame();
+        return;
+      }
+      if (topic === T.win && h.winner) { h.winner(m.name, m.cid, m.line); return; }
+    });
+
+    cli.on('reconnect', function () { if (roomSeen && h.status) h.status('wait'); });
+    cli.on('offline', function () { if (roomSeen && h.status) h.status('wait'); });
+    cli.on('error', function () { if (!settled && h.fail) h.fail('broker'); });
   }
 
-  function link(code, name, cid) {
-    conn = peer.connect(PREFIX + code, { reliable: true });
-
-    conn.on('open', function () {
-      retry = 0;
-      if (joinTimer) { clearTimeout(joinTimer); joinTimer = null; }
-      if (h.status) h.status('online');
-      try { conn.send({ t: 'hello', name: name, cid: cid }); } catch (e) { }
-    });
-
-    conn.on('data', function (m) {
-      if (!m || !m.t) return;
-      if (m.t === 'state' && h.state) h.state(m.called || [], m.last);
-      if (m.t === 'sheet' && h.sheet) h.sheet(m.grid);
-      if (m.t === 'newgame' && h.newgame) h.newgame();
-      if (m.t === 'winner' && h.winner) h.winner(m.name, m.cid, m.line);
-    });
-
-    conn.on('close', function () {
-      if (h.status) h.status('wait');
-      if (retry < 40) {
-        retry++;
-        setTimeout(function () { if (peer && !peer.destroyed) link(code, name, cid); }, 2500);
-      } else if (h.fail) h.fail('lost');
-    });
-
-    conn.on('error', function () { });
-  }
-
+  /* ═══════════ GỬI TIN ═══════════ */
   function broadcast(msg) {
-    for (var i = 0; i < conns.length; i++) {
-      try { if (conns[i].open) conns[i].send(msg); } catch (e) { }
+    if (!cli || role !== 'host') return;
+    if (msg.t === 'state') { send(T.state, msg, true); return; }
+    if (msg.t === 'newgame') {
+      Object.keys(seen).forEach(function (c) {      // thu hồi tờ cũ
+        try { cli.publish(T.sheet + c, '', { qos: 0, retain: true }); } catch (e) { }
+      });
+      send(T.ctl, { t: 'newgame' });
+      return;
     }
+    send(T.ctl, msg);
   }
 
   function toHost(msg) {
-    try { if (conn && conn.open) conn.send(msg); } catch (e) { }
+    if (!cli || role !== 'guest') return;
+    send(T.ev, msg);
+  }
+
+  function leave() {
+    if (cli && role === 'host' && T) send(T.host, { on: false }, true);
+    if (cli && role === 'guest' && T && myCid) send(T.ev, { t: 'bye', cid: myCid });
+    setTimeout(clear, 120);
   }
 
   return {
@@ -154,8 +224,10 @@ var Net = (function () {
     join: join,
     broadcast: broadcast,
     toHost: toHost,
-    leave: cleanup,
+    leave: leave,
     role: function () { return role; },
-    count: function () { return conns.length; }
+    count: function () { return Object.keys(seen).length; },
+    codeLen: function () { return 5; },
+    validCode: function (c) { return c.length === 5 && brokerOf(c) >= 0; }
   };
 })();

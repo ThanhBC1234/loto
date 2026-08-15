@@ -27,7 +27,8 @@
     joinErr: '',
     code: '',
     sheets: {},        // quản trò: mã máy → tờ đã phát, không phát trùng
-    cid: ''
+    cid: '',
+    hostErr: ''
   };
 
   /* ── bộ nhớ máy ── */
@@ -127,7 +128,9 @@
       '<p class="note">Luật ván này: tờ 5 hàng × 5 cột, cả 25 ô đều có số. ' +
         'Đủ 5 nắp trên một hàng ngang, một hàng dọc hoặc một đường xéo là kinh — tất cả 12 đường.<br>' +
         'Quản trò phát cho mỗi người một tờ riêng, không ai trùng ai và không đổi tờ được.<br>' +
-        'Máy quản trò giữ ván, nên quản trò cần để tab này mở suốt buổi.</p>';
+        'Máy quản trò giữ ván, nên quản trò cần để tab này mở suốt buổi. ' +
+        'Số được chuyển qua một máy chủ công cộng, ai cũng chơi được dù dùng 4G hay Wi-Fi khác nhau — ' +
+        'chỉ nên đọc mã phòng cho đúng người trong nhóm.</p>';
   }
 
   function stub(act, ic, tt, sb) {
@@ -141,13 +144,26 @@
   function viewCaller() {
     var left = 90 - S.called.length;
 
-    var head = S.room
-      ? '<div class="codebar"><div><div class="k">Mã phòng</div>' +
-        '<div class="v">' + esc(S.room) + '</div></div>' +
-        '<div class="k right">Đọc mã này cho cả nhóm nhập vào</div></div>' + connHtml()
-      : '<div class="codebar"><div><div class="k">Chế độ</div>' +
+    var head;
+    if (S.isHost) {
+      var open = S.conn === 'online' && S.room;
+      head = '<div class="codebar"><div><div class="k">Mã phòng</div>' +
+        '<div class="v' + (open ? '' : ' sm pending') + '">' +
+          (open ? esc(S.room) : (S.conn === 'bad' ? 'Không mở được' : 'Đang mở…')) +
+        '</div></div>' +
+        '<div class="k right">' +
+          (open ? 'Đọc mã này cho cả nhóm nhập vào'
+                : S.conn === 'bad' ? 'Chưa nối được máy chủ chuyển tiếp'
+                : 'Chờ mã hiện ra rồi hãy đọc cho cả nhóm') +
+        '</div></div>' + connHtml() +
+        (S.conn === 'bad'
+          ? '<p class="err">Không nối được máy chủ chuyển tiếp. Kiểm tra mạng rồi bấm "Về trang đầu" và mở phòng lại.</p>'
+          : '');
+    } else {
+      head = '<div class="codebar"><div><div class="k">Chế độ</div>' +
         '<div class="v sm">Hô miệng</div></div>' +
         '<div class="k right">Máy này bốc số, bạn hô lớn cho cả nhóm</div></div>';
+    }
 
     var board = '';
     for (var n = 1; n <= 90; n++) {
@@ -178,7 +194,8 @@
         '<span>' + (S.last === null ? 'chưa bốc' : S.last) + '</span></div></div>' +
       '<div class="rhyme">' + esc(S.rhyme) + '</div>' +
       '<div class="count">' + S.called.length + ' số đã ra · còn ' + left + '</div>' +
-      '<button class="btn btn-neon" data-act="draw"' + (left <= 0 ? ' disabled' : '') + '>' +
+      '<button class="btn btn-neon" data-act="draw"' +
+        ((left <= 0 || (S.isHost && S.conn !== 'online')) ? ' disabled' : '') + '>' +
         (left > 0 ? 'Bốc số' : 'Hết số rồi') + '</button>' +
       '<div class="gap"></div>' +
       '<button class="btn btn-ghost" data-act="reset">Ván mới</button>' +
@@ -194,14 +211,16 @@
     return '' +
       '<button class="back" data-act="back">← Về trang đầu</button>' +
       '<div class="lbl">Mã quản trò đọc</div>' +
-      '<input class="field code" id="fcode" maxlength="4" autocomplete="off" ' +
+      '<input class="field code" id="fcode" maxlength="5" autocomplete="off" ' +
         'autocapitalize="characters" placeholder="••••" aria-label="Mã phòng" value="' + esc(S.code) + '">' +
       '<div class="lbl">Tên của bạn</div>' +
       '<input class="field" id="fname" maxlength="20" placeholder="Gọi bạn là gì?" ' +
         'aria-label="Tên người chơi" value="' + esc(S.name) + '">' +
       (S.joinErr ? '<p class="err">' + esc(S.joinErr) + '</p>' : '') +
       '<button class="btn btn-gold" data-act="enter"' + (S.joining ? ' disabled' : '') + '>' +
-        (S.joining ? 'Đang tìm phòng…' : 'Vào phòng, nhận tờ') + '</button>';
+        (S.joining ? 'Đang tìm phòng…' : (S.joinErr ? 'Thử lại' : 'Vào phòng, nhận tờ')) + '</button>' +
+      '<p class="note">Mã gồm 5 ký tự, ký tự đầu là A, B hoặc C. ' +
+        'Nếu quản trò vừa mở lại phòng thì chờ vài giây rồi thử lại.</p>';
   }
 
   /* ═══════════ TỜ LÔ TÔ ═══════════ */
@@ -392,26 +411,28 @@
       S.called = []; S.last = null; S.sheets = {};
       S.rhyme = 'Bấm bốc số để mở màn.';
     }
-    S.wins = []; S.players = [];
+    S.wins = []; S.players = []; S.hostErr = '';
     tryHost(saved ? saved.code : null);
     S.screen = 'caller';
     render();
   }
 
   function tryHost(fixedCode) {
-    S.room = fixedCode || Game.newCode();
-    hostSave();
-    Net.host(S.room, {
+    S.room = fixedCode || null;
+    Net.host(fixedCode, {
       state: function () { return { called: S.called, last: S.last }; },
+      code: function (c) {
+        S.room = c; hostSave();
+        if (S.screen === 'caller') render();
+      },
       status: function (st) {
         S.conn = st;
         if (S.screen === 'caller') render();
       },
-      taken: function () {
-        if (hostTries++ < 6) return tryHost(null);   // mã kẹt thì đổi mã khác
-        S.conn = 'bad'; render();
+      fail: function (why) {
+        S.conn = 'bad'; S.hostErr = why;
+        if (S.screen === 'caller') render();
       },
-      fail: function () { S.conn = 'bad'; render(); },
       player: function (name, cid, pid, reply) {
         if (!S.sheets[cid]) {
           var used = Object.keys(S.sheets).map(function (k) { return Game.cardKey(S.sheets[k]); });
@@ -471,7 +492,11 @@
     var code = ((fc ? fc.value : S.code) || '').trim().toUpperCase();
     S.code = code;
     S.name = ((fn ? fn.value : S.name) || '').trim();
-    if (code.length !== 4) { S.joinErr = 'Mã phòng gồm 4 ký tự.'; render(); return; }
+    if (code.length !== 5) { S.joinErr = 'Mã phòng gồm 5 ký tự.'; render(); return; }
+    if (!Net.validCode(code)) {
+      S.joinErr = 'Mã này không đúng dạng. Ký tự đầu phải là A, B hoặc C — đọc lại mã trên máy quản trò.';
+      render(); return;
+    }
     if (!Net.ready()) { S.joinErr = 'Chưa tải được thư viện kết nối. Kiểm tra mạng rồi tải lại trang.'; render(); return; }
 
     S.joining = true; S.joinErr = ''; render();
@@ -512,9 +537,11 @@
       },
       fail: function (why) {
         S.joining = false; S.screen = 'join';
-        S.joinErr = (why === 'noroom' || why === 'timeout')
-          ? 'Không vào được phòng ' + code + '. Kiểm tra lại mã, và chắc chắn máy quản trò vẫn đang mở.'
-          : why === 'lost' ? 'Mất kết nối với quản trò quá lâu. Thử vào lại phòng.'
+        S.joinErr =
+          why === 'noroom' ? 'Nối được máy chủ nhưng không thấy phòng ' + code +
+            '. Mã có thể sai, hoặc máy quản trò đã đóng trang. Nhờ quản trò đọc lại mã.'
+          : why === 'broker' ? 'Không nối được máy chủ chuyển tiếp. Kiểm tra mạng của máy bạn rồi thử lại.'
+          : why === 'badcode' ? 'Mã này không đúng dạng. Ký tự đầu phải là A, B hoặc C.'
           : 'Chưa tải được thư viện kết nối. Kiểm tra mạng rồi tải lại trang.';
         Net.leave();
         render();

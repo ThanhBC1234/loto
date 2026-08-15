@@ -103,6 +103,7 @@ body{
   color:var(--mist);font-weight:700}
 .codebar .v{font-size:27px;font-weight:900;color:var(--gold);letter-spacing:.2em;line-height:1.1}
 .codebar .v.sm{font-size:17px;letter-spacing:0}
+.codebar .v.pending{color:var(--mist)}
 .codebar .right{text-align:right;max-width:160px}
 
 /* ── trạng thái kết nối ── */
