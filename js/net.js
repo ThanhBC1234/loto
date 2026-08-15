@@ -31,9 +31,11 @@ var Net = (function () {
   var T = null;
   var seen = {};            // quản trò: mã máy đang trong phòng
   var myCid = null;
+  var mySid = null;
   var tries = 0;
   var timer = null;
   var settled = false;
+  var runId = 0;            // vô hiệu callback của kết nối cũ
 
   function ready() { return typeof mqtt !== 'undefined'; }
 
@@ -50,11 +52,18 @@ var Net = (function () {
 
   function cid8() { return 'lt' + Math.random().toString(16).slice(2, 10); }
 
-  function clear() {
+  function release(delay) {
+    var oldCli = cli;
+    runId++;
     if (timer) { clearTimeout(timer); timer = null; }
-    if (cli) { try { cli.end(true); } catch (e) { } }
-    cli = null; role = null; code = null; T = null; seen = {}; settled = false; tries = 0;
+    cli = null; role = null; h = {}; code = null; T = null; seen = {};
+    myCid = null; mySid = null; settled = false; tries = 0;
+    if (oldCli) {
+      if (delay) setTimeout(function () { try { oldCli.end(true); } catch (e) { } }, delay);
+      else { try { oldCli.end(true); } catch (e2) { } }
+    }
   }
+  function clear() { release(0); }
 
   function send(topic, obj, retain) {
     if (!cli) return;
@@ -68,13 +77,15 @@ var Net = (function () {
   function host(fullCode, handlers) {
     clear();
     role = 'host'; h = handlers || {};
+    var currentRun = runId;
     if (!ready()) { if (h.fail) h.fail('nolib'); return; }
     tries = fullCode ? brokerOf(fullCode) : 0;
     if (tries < 0) { if (h.fail) h.fail('badcode'); return; }
-    hostTry(fullCode, !fullCode);
+    hostTry(fullCode, !fullCode, currentRun);
   }
 
-  function hostTry(fullCode, mayHop) {
+  function hostTry(fullCode, mayHop, currentRun) {
+    if (currentRun !== runId) return;
     if (tries >= BROKERS.length) { if (h.fail) h.fail('broker'); return; }
     var B = BROKERS[tries];
     code = fullCode || (B.tag + Game.newCode());
@@ -82,63 +93,81 @@ var Net = (function () {
 
     if (h.status) h.status('wait');
 
-    cli = mqtt.connect(B.url, {
+    var client = mqtt.connect(B.url, {
       clientId: 'loto_' + cid8(),
       clean: true, keepalive: 30,
       connectTimeout: 9000, reconnectPeriod: 3000,
       will: { topic: T.host, payload: JSON.stringify({ on: false }), qos: 0, retain: true }
     });
+    cli = client;
+
+    function active() { return currentRun === runId && cli === client; }
 
     var hopped = false;
     function hop() {
-      if (hopped || !mayHop) return;
+      if (hopped || !mayHop || !active()) return;
       hopped = true;
-      try { cli.end(true); } catch (e) { }
+      try { client.end(true); } catch (e) { }
       tries++;
-      hostTry(null, true);
+      hostTry(null, true, currentRun);
     }
     timer = setTimeout(function () {
+      if (!active()) return;
       if (!settled) { if (mayHop) hop(); else if (h.fail) h.fail('broker'); }
     }, 11000);
 
-    cli.on('connect', function () {
+    client.on('connect', function () {
+      if (!active()) return;
       settled = true;
       if (timer) { clearTimeout(timer); timer = null; }
-      cli.subscribe(T.ev, { qos: 0 });
+      client.subscribe(T.ev, { qos: 0 });
       send(T.host, { on: true }, true);
       if (h.state) send(T.state, { t: 'state', called: h.state().called, last: h.state().last }, true);
       if (h.code) h.code(code);
       if (h.status) h.status('online');
     });
 
-    cli.on('message', function (topic, buf) {
+    client.on('message', function (topic, buf) {
+      if (!active()) return;
       if (topic !== T.ev) return;
       var m; try { m = JSON.parse(buf.toString()); } catch (e) { return; }
       if (!m || !m.t) return;
 
       if (m.t === 'hello' && h.player) {
-        seen[m.cid] = 1;
+        if (typeof m.cid !== 'string' || !m.cid) return;
+        seen[m.cid] = m.sid || 1;
         h.player(m.name || 'Khách', m.cid, m.cid, function (msg) {
           send(T.sheet + m.cid, msg, true);
         });
       }
-      if (m.t === 'bye') { delete seen[m.cid]; if (h.leave) h.leave(m.cid); }
+      if (m.t === 'bye') {
+        if (typeof m.cid !== 'string' || !m.cid) return;
+        if (m.sid && seen[m.cid] && seen[m.cid] !== m.sid) return;
+        delete seen[m.cid]; if (h.leave) h.leave(m.cid);
+      }
       if (m.t === 'kinh' && h.kinh) {
-        h.kinh(m.name || 'Khách', m.cid, m.line);
-        send(T.win, { name: m.name || 'Khách', cid: m.cid, line: m.line, at: Date.now() });
+        if (typeof m.cid !== 'string' || !m.cid) return;
+        if (m.sid && seen[m.cid] && seen[m.cid] !== m.sid) return;
+        var winner = h.kinh(m.name || 'Khách', m.cid, m.line);
+        if (winner) {
+          send(T.win, { name: typeof winner === 'string' ? winner : (m.name || 'Khách'),
+            cid: m.cid, line: m.line, at: Date.now() });
+        }
       }
     });
 
-    cli.on('reconnect', function () { if (h.status) h.status('wait'); });
-    cli.on('offline', function () { if (h.status) h.status('wait'); });
-    cli.on('error', function () { if (!settled) hop(); });
-    cli.on('close', function () { if (!settled) hop(); });
+    client.on('reconnect', function () { if (active() && h.status) h.status('wait'); });
+    client.on('offline', function () { if (active() && h.status) h.status('wait'); });
+    client.on('error', function () { if (active() && !settled) hop(); });
+    client.on('close', function () { if (active() && !settled) hop(); });
   }
 
   /* ═══════════ NGƯỜI CHƠI ═══════════ */
   function join(fullCode, name, myId, handlers) {
     clear();
     role = 'guest'; h = handlers || {}; myCid = myId;
+    mySid = cid8();
+    var currentRun = runId;
     if (!ready()) { if (h.fail) h.fail('nolib'); return; }
 
     var bi = brokerOf(fullCode);
@@ -147,23 +176,28 @@ var Net = (function () {
     code = fullCode; T = topics(code);
     var roomSeen = false;
 
-    cli = mqtt.connect(BROKERS[bi].url, {
+    var client = mqtt.connect(BROKERS[bi].url, {
       clientId: 'loto_' + cid8(),
       clean: true, keepalive: 30,
       connectTimeout: 9000, reconnectPeriod: 3000,
-      will: { topic: T.ev, payload: JSON.stringify({ t: 'bye', cid: myCid }), qos: 0, retain: false }
+      will: { topic: T.ev, payload: JSON.stringify({ t: 'bye', cid: myCid, sid: mySid }), qos: 0, retain: false }
     });
+    cli = client;
+
+    function active() { return currentRun === runId && cli === client; }
 
     timer = setTimeout(function () {
-      if (!roomSeen && h.fail) h.fail(settled ? 'noroom' : 'broker');
+      if (active() && !roomSeen && h.fail) h.fail(settled ? 'noroom' : 'broker');
     }, 12000);
 
-    cli.on('connect', function () {
+    client.on('connect', function () {
+      if (!active()) return;
       settled = true;
-      cli.subscribe([T.host, T.state, T.ctl, T.win, T.sheet + myCid], { qos: 0 });
+      client.subscribe([T.host, T.state, T.ctl, T.win, T.sheet + myCid], { qos: 0 });
     });
 
-    cli.on('message', function (topic, buf) {
+    client.on('message', function (topic, buf) {
+      if (!active()) return;
       var txt = buf.toString();
       if (!txt) return;                       // tin đã bị xoá
       var m; try { m = JSON.parse(txt); } catch (e) { return; }
@@ -174,8 +208,8 @@ var Net = (function () {
             roomSeen = true;
             if (timer) { clearTimeout(timer); timer = null; }
             if (h.status) h.status('online');
-            send(T.ev, { t: 'hello', name: name, cid: myCid });
           } else if (h.status) h.status('online');
+          send(T.ev, { t: 'hello', name: name, cid: myCid, sid: mySid });
         } else if (roomSeen && h.status) h.status('wait');
         return;
       }
@@ -188,9 +222,9 @@ var Net = (function () {
       if (topic === T.win && h.winner) { h.winner(m.name, m.cid, m.line); return; }
     });
 
-    cli.on('reconnect', function () { if (roomSeen && h.status) h.status('wait'); });
-    cli.on('offline', function () { if (roomSeen && h.status) h.status('wait'); });
-    cli.on('error', function () { if (!settled && h.fail) h.fail('broker'); });
+    client.on('reconnect', function () { if (active() && roomSeen && h.status) h.status('wait'); });
+    client.on('offline', function () { if (active() && roomSeen && h.status) h.status('wait'); });
+    client.on('error', function () { if (active() && !settled && h.fail) h.fail('broker'); });
   }
 
   /* ═══════════ GỬI TIN ═══════════ */
@@ -209,13 +243,16 @@ var Net = (function () {
 
   function toHost(msg) {
     if (!cli || role !== 'guest') return;
-    send(T.ev, msg);
+    var out = {}, k;
+    for (k in msg) if (Object.prototype.hasOwnProperty.call(msg, k)) out[k] = msg[k];
+    out.sid = mySid;
+    send(T.ev, out);
   }
 
   function leave() {
     if (cli && role === 'host' && T) send(T.host, { on: false }, true);
-    if (cli && role === 'guest' && T && myCid) send(T.ev, { t: 'bye', cid: myCid });
-    setTimeout(clear, 120);
+    if (cli && role === 'guest' && T && myCid) send(T.ev, { t: 'bye', cid: myCid, sid: mySid });
+    release(120);
   }
 
   return {

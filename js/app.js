@@ -45,18 +45,26 @@
     return k;
   }
   function marksKey() { return 'loto:marks:' + (S.room || 'roi') + ':' + S.cid; }
+  function cardKey() { return 'loto:card:' + (S.room || 'roi') + ':' + S.cid; }
   function saveMarks() { ls(marksKey(), JSON.stringify(Array.from(S.marks))); }
   function loadMarks() {
     try { return new Set(JSON.parse(ls(marksKey()) || '[]')); } catch (e) { return new Set(); }
   }
   function clearMarks() { ls(marksKey(), null); }
+  function loadMarksForGrid(grid) {
+    var next = Game.cardKey(grid), prev = ls(cardKey());
+    if (prev && prev !== next) { clearMarks(); S.claimed = {}; }
+    ls(cardKey(), next);
+    return loadMarks();
+  }
+  function clearSavedCard() { clearMarks(); ls(cardKey(), null); }
 
   /* Quản trò: giữ ván trong máy để tải lại trang không mất phòng */
   function hostSave() {
     if (!S.isHost || !S.room) return;
     ls('loto:host', JSON.stringify({
       code: S.room, called: S.called, last: S.last,
-      sheets: S.sheets, at: Date.now()
+      sheets: S.sheets, wins: S.wins, at: Date.now()
     }));
   }
   function hostLoad() {
@@ -116,7 +124,7 @@
       stub('host', '🎤', 'Tôi làm quản trò',
         'Mở phòng, lấy mã, bốc số. Số ra hiện thẳng trên máy mọi người.') +
       stub('join', '🎟️', 'Tôi vào phòng',
-        'Nhập mã 4 ký tự quản trò đọc, nhận một tờ lô tô riêng.') +
+        'Nhập mã 5 ký tự quản trò đọc, nhận một tờ lô tô riêng.') +
       '<div class="lbl">Không cần mã phòng</div>' +
       stub('solocaller', '🥁', 'Bốc số để hô miệng',
         'Một máy bốc số, quản trò hô lớn. Máy khác chỉ cầm tờ.') +
@@ -212,7 +220,7 @@
       '<button class="back" data-act="back">← Về trang đầu</button>' +
       '<div class="lbl">Mã quản trò đọc</div>' +
       '<input class="field code" id="fcode" maxlength="5" autocomplete="off" ' +
-        'autocapitalize="characters" placeholder="••••" aria-label="Mã phòng" value="' + esc(S.code) + '">' +
+        'autocapitalize="characters" placeholder="•••••" aria-label="Mã phòng" value="' + esc(S.code) + '">' +
       '<div class="lbl">Tên của bạn</div>' +
       '<input class="field" id="fname" maxlength="20" placeholder="Gọi bạn là gì?" ' +
         'aria-label="Tên người chơi" value="' + esc(S.name) + '">' +
@@ -343,6 +351,7 @@
       var on = S.marks.has(key);
       b.classList.toggle('called', !!(S.room && !on && S.called.indexOf(n) !== -1));
       b.classList.toggle('win', !!winCells[key]);
+      b.setAttribute('aria-label', 'Số ' + n + (on ? ', đã đậy' : ''));
       var cap = b.querySelector('.cap');
       if (on && !cap) {
         var s = document.createElement('span');
@@ -406,12 +415,14 @@
       S.called = saved.called || [];
       S.last = (saved.last === undefined ? null : saved.last);
       S.sheets = saved.sheets || {};
+      S.wins = saved.wins || [];
       S.rhyme = 'Phòng đã mở lại. Bốc tiếp thôi.';
     } else {
       S.called = []; S.last = null; S.sheets = {};
+      S.wins = [];
       S.rhyme = 'Bấm bốc số để mở màn.';
     }
-    S.wins = []; S.players = []; S.hostErr = '';
+    S.players = []; S.hostErr = '';
     tryHost(saved ? saved.code : null);
     S.screen = 'caller';
     render();
@@ -455,10 +466,25 @@
         if (S.screen === 'caller') render();
       },
       kinh: function (name, cid, line) {
-        S.wins.push({ name: name, line: line });
+        var grid = S.sheets[cid], winningLine = null;
+        for (var i = 0; i < Game.LINES.length; i++) {
+          if (Game.LINES[i].label === line) { winningLine = Game.LINES[i]; break; }
+        }
+        if (!grid || !winningLine) return false;
+        var valid = winningLine.cells.every(function (rc) {
+          return S.called.indexOf(grid[rc[0]][rc[1]]) !== -1;
+        });
+        if (!valid) return false;
+        var duplicate = S.wins.some(function (w) { return w.cid === cid && w.line === line; });
+        if (duplicate) return false;
+        var player = S.players.filter(function (p) { return p.cid === cid; })[0];
+        name = player ? player.name : name;
+        S.wins.push({ cid: cid, name: name, line: line });
+        hostSave();
         Sfx.kinh();
         if (S.screen === 'caller') render();
         showKinh(line, name);
+        return name;
       }
     });
   }
@@ -499,26 +525,27 @@
     }
     if (!Net.ready()) { S.joinErr = 'Chưa tải được thư viện kết nối. Kiểm tra mạng rồi tải lại trang.'; render(); return; }
 
-    S.joining = true; S.joinErr = ''; render();
+    S.joining = true; S.joinErr = ''; S.conn = 'wait';
+    S.room = code; S.isHost = false; S.grid = null; S.claimed = {};
+    S.marks = loadMarks(); S.called = []; S.last = null;
+    render();
 
     Net.join(code, S.name || 'Khách', S.cid, {
       status: function (st) {
         S.conn = st;
         if (st === 'online' && S.screen !== 'card') {
-          S.joining = false; S.room = code; S.isHost = false;
-          S.grid = null; S.claimed = {}; S.marks = loadMarks();
-          S.called = []; S.last = null; S.screen = 'card';
+          S.joining = false; S.screen = 'card';
           render();
         } else if (S.screen === 'card') { patchConn(); }
         else { render(); }
       },
       sheet: function (grid) {
         S.grid = grid;
-        S.marks = loadMarks();
+        S.marks = loadMarksForGrid(grid);
         render();
       },
       newgame: function () {
-        clearMarks();
+        clearSavedCard();
         S.grid = null; S.marks = new Set(); S.claimed = {};
         S.called = []; S.last = null;
         render();
@@ -536,7 +563,9 @@
         toast(name + ' vừa kinh ' + line);
       },
       fail: function (why) {
-        S.joining = false; S.screen = 'join';
+        S.joining = false; S.screen = 'join'; S.room = null;
+        S.grid = null; S.marks = null; S.claimed = {};
+        S.called = []; S.last = null;
         S.joinErr =
           why === 'noroom' ? 'Nối được máy chủ nhưng không thấy phòng ' + code +
             '. Mã có thể sai, hoặc máy quản trò đã đóng trang. Nhờ quản trò đọc lại mã.'
@@ -573,7 +602,7 @@
     Net.leave();
     S.screen = 'home'; S.room = null; S.isHost = false; S.conn = 'wait';
     S.called = []; S.last = null; S.wins = []; S.players = []; S.sheets = {};
-    S.grid = null; S.claimed = {}; S.joining = false; S.joinErr = ''; S.note = '';
+    S.grid = null; S.marks = null; S.claimed = {}; S.joining = false; S.joinErr = ''; S.note = '';
     render();
   }
 
